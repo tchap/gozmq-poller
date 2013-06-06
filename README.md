@@ -62,6 +62,12 @@ func main() {
 }
 ```
 
+# Documentation
+
+We are writing Go, so of course there is some generated
+[Godoc documentation](http://godoc.org/github.com/tchap/gozmq-poller)
+available.
+
 # Contributing
 
 As all open source projects, we welcome any reasonable contributions,
