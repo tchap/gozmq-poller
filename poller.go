@@ -1,27 +1,31 @@
 /*
-	Copyright (C) 2013 Ondrej Kupka
-	Copyright (C) 2013 Contributors as noted in the AUTHORS file
+Copyright (C) 2013 Ondrej Kupka
+Copyright (C) 2013 Contributors as noted in the AUTHORS file
 
-	Permission is hereby granted, free of charge, to any person obtaining a copy
-	of this software and associated documentation files (the "Software"),
-	to deal in the Software without restriction, including without limitation
-	the rights to use, copy, modify, merge, publish, distribute, sublicense,
-	and/or sell copies of the Software, and to permit persons to whom
-	the Software is furnished to do so, subject to the following conditions:
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, and to permit persons to whom
+the Software is furnished to do so, subject to the following conditions:
 
-	The above copyright notice and this permission notice shall be included
-	in all copies or substantial portions of the Software.
+The above copyright notice and this permission notice shall be included
+in all copies or substantial portions of the Software.
 
-	THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-	IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-	FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
-	THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-	LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-	FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-	IN THE SOFTWARE.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+IN THE SOFTWARE.
 */
 
-package gzu
+/*
+Package gozmq-poller turns polling on ZeroMQ socket descriptions into selecting
+on channels.
+*/
+package poller
 
 import (
 	"errors"
@@ -29,12 +33,6 @@ import (
 )
 
 import zmq "github.com/alecthomas/gozmq"
-
-/**
- * Poller
- */
-
-// Constants
 
 const (
 	statePolling = iota
@@ -53,9 +51,8 @@ const (
 	defaultCmdChannelLen = 10
 )
 
-// Structs
-
 type Poller struct {
+	// For checking if the poller has been closed.
 	state int
 
 	// For sending interrupts
@@ -74,19 +71,21 @@ type Poller struct {
 	lock sync.Mutex
 }
 
+// The command struct is sent over a channel to the backround gorouting to
+// control it.
 type command struct {
 	Cmd  int
 	Args interface{}
 }
 
+// PollResult is sent back to the user once polling returns.
 type PollResult struct {
 	Count int
 	Items zmq.PollItems
 	Error error
 }
 
-// Constructor
-
+// Poller constructor
 func New(ctx *zmq.Context, optChanLen int) (p *Poller, err error) {
 	var cmdChanLen int
 
@@ -133,8 +132,7 @@ closeIn:
 	return
 }
 
-// Commands
-
+// Poll starts polling on the set of socket descriptors.
 func (self *Poller) Poll(items zmq.PollItems) (<-chan *PollResult, error) {
 	self.lock.Lock()
 	defer self.lock.Unlock()
@@ -153,6 +151,11 @@ func (self *Poller) Poll(items zmq.PollItems) (<-chan *PollResult, error) {
 	return self.pollChan, nil
 }
 
+/*
+Stop will pause polling until Continue is called again. This call breaks the
+call to gozmq.Poll and makes the poller wait for more commands to come, no other
+descriptors.
+*/
 func (self *Poller) Stop() (err error) {
 	self.lock.Lock()
 	defer self.lock.Unlock()
@@ -164,6 +167,13 @@ func (self *Poller) Stop() (err error) {
 	return self.command(&command{cmdStop, nil})
 }
 
+/*
+Continue resumes the poller after a call to Stop or after the polling is
+successful. The poller is automaticall paused before returning a PollResult,
+otherwise gozmq.Poll would keep returning again and again until the user reads
+what is available on the descriptors passed to the poller. We want to prevent
+such a busy-waiting and flooding of the result channel.
+*/
 func (self *Poller) Continue() (err error) {
 	self.lock.Lock()
 	defer self.lock.Unlock()
@@ -175,6 +185,10 @@ func (self *Poller) Continue() (err error) {
 	return self.command(&command{cmdContinue, nil})
 }
 
+/*
+Close the poller and return what descriptors were available at the time of the
+call.
+*/
 func (self *Poller) Close() (resChan <-chan *PollResult, err error) {
 	self.lock.Lock()
 	defer self.lock.Unlock()
@@ -192,6 +206,7 @@ func (self *Poller) Close() (resChan <-chan *PollResult, err error) {
 	return
 }
 
+// Check if the poller was closed.
 func (self *Poller) IsClosed() bool {
 	self.lock.Lock()
 	defer self.lock.Unlock()
@@ -199,19 +214,27 @@ func (self *Poller) IsClosed() bool {
 	return self.state == stateClosed
 }
 
-// Commands helper functions
-
+// Send a command to the poller.
 func (self *Poller) command(cmd *command) (err error) {
 	self.cmdChan <- cmd
 	return self.interrupt()
 }
 
+// Interrupt the call to gozmq.Poll().
 func (self *Poller) interrupt() (err error) {
 	return self.intIn.Send([]byte{0}, 0)
 }
 
-// Main worker goroutine
+/*
+The worker goroutine is there to run in the background and manage the polling.
+The whole mechanism of management is implemented by commands which are sent to
+the poller goroutine. A PAIR socket is added to the descriptors passed into the
+poller for polling. If it is necessary to break out of the loop, it is enough to
+signal that added PAIR socket and gozmq.Poll() returns.
 
+Once gozmq.Poll() returns, the PAIR socket is checked first for any commands. If
+there are no commands to process, the PollResult is sent back to the user.
+*/
 func (self *Poller) worker() {
 	intItem := zmq.PollItem{
 		Socket: self.intOut,
@@ -283,6 +306,7 @@ func (self *Poller) worker() {
 	}
 }
 
+// Finalize the poller, make sure everything is stopped and closed.
 func (self *Poller) finalize(exitCallback func()) {
 	self.lock.Lock()
 	defer self.lock.Unlock()

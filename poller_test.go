@@ -21,7 +21,7 @@
 	IN THE SOFTWARE.
 */
 
-package gzu
+package poller
 
 import (
 	"errors"
