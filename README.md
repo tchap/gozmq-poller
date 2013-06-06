@@ -69,6 +69,6 @@ particularly bug fixes :-) Since this project is rather small, it is
 questionable if there is really anything to add. There is always some space for
 improvements, though :-)
 
-# Copying
+# License
 
-See the `AUTHORS` file.
+See the `COPYING` file.
