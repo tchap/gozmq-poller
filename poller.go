@@ -22,8 +22,8 @@ IN THE SOFTWARE.
 */
 
 /*
-Package gozmq-poller turns polling on ZeroMQ socket descriptions into selecting
-on channels.
+Package gozmq-poller turns polling on ZeroMQ socket descriptors into selecting
+on channels, thus making the whole thing much more Go-friendly.
 */
 package poller
 
