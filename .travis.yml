@@ -1,8 +1,9 @@
 language: go
+go:
+  - 1.0
+  - 1.1
 
 before_install:
-  - gvm install go1.1 && gvm use go1.1
-  - go version
   - sudo apt-get install libzmq3-dev
 
 install:
