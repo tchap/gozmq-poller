@@ -62,6 +62,12 @@ func main() {
 }
 ```
 
+# Caveats
+
+Make sure to wait on the channel returned by `Poller.Close` before calling your `gozmq.Context.Close`.
+If you don't do that, you are risking getting blocked indefinitely in the call to `gozmq.Context.Close`
+since the sockets may not be closed properly at that time.
+
 # Documentation
 
 We are writing Go, so of course there is some generated
