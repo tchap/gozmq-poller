@@ -1,81 +1,58 @@
 /*
-Copyright (C) 2013 Ondrej Kupka
-Copyright (C) 2013 Contributors as noted in the AUTHORS file
+	Copyright (C) 2013 Ondrej Kupka
+	Copyright (C) 2013 Contributors as noted in the AUTHORS file
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"),
-to deal in the Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, sublicense,
-and/or sell copies of the Software, and to permit persons to whom
-the Software is furnished to do so, subject to the following conditions:
+	Permission is hereby granted, free of charge, to any person obtaining a copy
+	of this software and associated documentation files (the "Software"),
+	to deal in the Software without restriction, including without limitation
+	the rights to use, copy, modify, merge, publish, distribute, sublicense,
+	and/or sell copies of the Software, and to permit persons to whom
+	the Software is furnished to do so, subject to the following conditions:
 
-The above copyright notice and this permission notice shall be included
-in all copies or substantial portions of the Software.
+	The above copyright notice and this permission notice shall be included
+	in all copies or substantial portions of the Software.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
-THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+	THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+	IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+	FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+	THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+	LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+	FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+	IN THE SOFTWARE.
 */
 
-/*
-Package gozmq-poller turns polling on ZeroMQ socket descriptors into selecting
-on channels, thus making the whole thing much more Go-friendly.
-*/
+// Package gozmq-poller turns polling on ZeroMQ socket descriptors into
+// selecting on channels, thus making the whole thing much more Go-friendly.
 package poller
 
 import (
-	"errors"
-	"sync"
-)
-
-import zmq "github.com/alecthomas/gozmq"
-
-const (
-	statePolling = iota
-	stateClosed
+	zmq "github.com/alecthomas/gozmq"
+	log "github.com/cihub/seelog"
+	sm "github.com/tchap/go-statemachine"
 )
 
 const (
-	cmdPoll = iota
-	cmdStop
-	cmdContinue
-	cmdClose
+	interruptEndpoint = "inproc://gozmqPoller_8DUvkrWQYP"
 )
 
-const (
-	interruptEndpoint    = "inproc://gozmqPoller_8DUvkrWQYP"
-	defaultCmdChannelLen = 10
-)
+// EXPORTED TYPES -------------------------------------------------------------
 
 type Poller struct {
-	// For checking if the poller has been closed.
-	state int
+	// Internal state machine
+	sm *sm.StateMachine
 
-	// For sending interrupts
+	// Internal stuff for managing the internal goroutine
 	intIn  *zmq.Socket
 	intOut *zmq.Socket
+	intCh  chan struct{}
+	cmdCh  chan sm.State
 
-	// For exchanging commands
-	cmdChan chan *command
+	// Placeholders for various arguments to be passed to the internal goroutine.
+	items  zmq.PollItems
+	pollCh chan<- *PollResult
 
-	// For returning results
-	pollChan chan *PollResult
-
-	// For signalizing exit
-	exitChan chan bool
-
-	lock sync.Mutex
-}
-
-// The command struct is sent over a channel to the backround gorouting to
-// control it.
-type command struct {
-	Cmd  int
-	Args interface{}
+	// A logger that is being used. seelog.Current is the default.
+	Logger log.LoggerInterface
 }
 
 // PollResult is sent back to the user once polling returns.
@@ -85,245 +62,303 @@ type PollResult struct {
 	Error error
 }
 
-// Poller constructor
-func New(ctx *zmq.Context, optChanLen int) (p *Poller, err error) {
-	var cmdChanLen int
+// STATES & EVENTS ------------------------------------------------------------
 
+const (
+	stateInitial = iota
+	statePolling
+	statePaused
+	stateClosed
+)
+
+const (
+	cmdPoll = iota
+	cmdPause
+	cmdContinue
+	cmdClose
+)
+
+// CONSTRUCTOR & METHODS ------------------------------------------------------
+
+// Poller constructor
+func New(ctx *zmq.Context) (p *Poller, err error) {
+	// Create and connect the internal interrupt sockets.
 	in, err := ctx.NewSocket(zmq.PAIR)
 	if err != nil {
 		return
 	}
 	out, err := ctx.NewSocket(zmq.PAIR)
 	if err != nil {
-		goto closeIn
+		in.Close()
+		return
 	}
 
 	err = out.Bind(interruptEndpoint)
 	if err != nil {
-		goto closeBoth
+		in.Close()
+		out.Close()
+		return
 	}
 	err = in.Connect(interruptEndpoint)
 	if err != nil {
-		goto closeBoth
-	}
-
-	if optChanLen > 0 {
-		cmdChanLen = optChanLen
-	} else {
-		cmdChanLen = defaultCmdChannelLen
-	}
-
-	p = &Poller{
-		state:    statePolling,
-		intIn:    in,
-		intOut:   out,
-		cmdChan:  make(chan *command, cmdChanLen),
-		pollChan: make(chan *PollResult),
-		exitChan: make(chan bool, 1),
-	}
-
-	go p.worker()
-	return
-
-closeBoth:
-	out.Close()
-closeIn:
-	in.Close()
-	return
-}
-
-// Poll starts polling on the set of socket descriptors.
-func (self *Poller) Poll(items zmq.PollItems) (<-chan *PollResult, error) {
-	self.lock.Lock()
-	defer self.lock.Unlock()
-
-	if self.state == stateClosed {
-		return nil, errors.New("Poller already closed.")
-	}
-
-	close(self.pollChan)
-	self.pollChan = make(chan *PollResult)
-
-	err := self.command(&command{cmdPoll, &items})
-	if err != nil {
-		return nil, err
-	}
-	return self.pollChan, nil
-}
-
-/*
-Stop will pause polling until Continue is called again. This call breaks the
-call to gozmq.Poll and makes the poller wait for more commands to come, no other
-descriptors.
-*/
-func (self *Poller) Stop() (err error) {
-	self.lock.Lock()
-	defer self.lock.Unlock()
-
-	if self.state == stateClosed {
-		return errors.New("Poller already closed.")
-	}
-
-	return self.command(&command{cmdStop, nil})
-}
-
-/*
-Continue resumes the poller after a call to Stop or after the polling is
-successful. The poller is automaticall paused before returning a PollResult,
-otherwise gozmq.Poll would keep returning again and again until the user reads
-what is available on the descriptors passed to the poller. We want to prevent
-such a busy-waiting and flooding of the result channel.
-*/
-func (self *Poller) Continue() (err error) {
-	self.lock.Lock()
-	defer self.lock.Unlock()
-
-	if self.state == stateClosed {
-		return errors.New("Poller already closed.")
-	}
-
-	return self.command(&command{cmdContinue, nil})
-}
-
-/*
-Close the poller and return what descriptors were available at the time of the
-call.
-*/
-func (self *Poller) Close() (resChan <-chan *PollResult, err error) {
-	self.lock.Lock()
-	defer self.lock.Unlock()
-
-	if self.state == stateClosed {
-		err = errors.New("Poller already closed.")
+		in.Close()
+		out.Close()
 		return
 	}
 
-	ch := make(chan *PollResult, 1)
-	err = self.command(&command{cmdClose, ch})
-	if err == nil {
-		resChan = ch
+	// Create and inititalise the internal state machine.
+	psm := sm.New(stateInitial, 4, 4, 0)
+
+	p = &Poller{
+		sm:     psm,
+		intIn:  in,
+		intOut: out,
+		cmdCh:  make(chan sm.State, 1),
 	}
+
+	// POLL
+	psm.On(cmdPoll, []sm.State{
+		stateInitial,
+		statePolling,
+		statePaused,
+	}, p.handlePoll)
+
+	// PAUSE
+	psm.On(cmdPause, []sm.State{
+		statePolling,
+	}, p.handlePause)
+
+	// CONTINUE
+	psm.On(cmdContinue, []sm.State{
+		statePaused,
+	}, p.handleContinue)
+
+	// CLOSE
+	psm.On(cmdClose, []sm.State{
+		stateInitial,
+		statePolling,
+		statePaused,
+	}, p.handleClose)
+
 	return
 }
 
-// Check if the poller was closed.
-func (self *Poller) IsClosed() bool {
-	self.lock.Lock()
-	defer self.lock.Unlock()
+// Poll -----------------------------------------------------------------------
 
-	return self.state == stateClosed
+type pollArgs struct {
+	items  zmq.PollItems
+	pollCh chan<- *PollResult
 }
 
-// Send a command to the poller.
-func (self *Poller) command(cmd *command) (err error) {
-	self.cmdChan <- cmd
-	return self.interrupt()
+// Poll starts polling on the set of socket descriptors passed as a parameter.
+// The channel passed into this method is used for sending notifications when
+// gozmq.Poll() unblocks.
+func (self *Poller) Poll(items zmq.PollItems, pollCh chan<- *PollResult) error {
+	if len(items) == 0 {
+		panic("Poll items are empty")
+	}
+	if pollCh == nil {
+		panic("Poll channel is nil")
+	}
+
+	errCh := make(chan error, 1)
+	self.sm.Emit(&sm.Event{
+		cmdPoll,
+		&pollArgs{items, pollCh},
+	}, errCh)
+	return <-errCh
 }
+
+func (self *Poller) handlePoll(s sm.State, e *sm.Event) (next sm.State) {
+	args := e.Data.(*pollArgs)
+
+	self.items = args.items
+	self.pollCh = args.pollCh
+
+	// Break the current polling loop if there is any.
+	if s == statePolling {
+		err := self.interruptPolling(nil)
+		if err != nil {
+			args.pollCh <- &PollResult{-1, nil, err}
+			close(self.pollCh)
+		}
+		self.cmdCh <- cmdPoll
+	} else {
+		go self.poll()
+	}
+
+	return statePolling
+}
+
+// Pause ----------------------------------------------------------------------
+
+// Pause will pause polling until Continue is called again. This call breaks
+// the call to gozmq.Poll and makes the poller wait for more commands to come.
+//
+// If pauseCh is not nil, it will be closed when the poll call is interrupted
+// to signal that the 0MQ sockets are no longer in use.
+func (self *Poller) Pause(pauseCh chan struct{}) error {
+	errCh := make(chan error, 1)
+	self.sm.Emit(&sm.Event{
+		cmdPause,
+		pauseCh,
+	}, errCh)
+	return <-errCh
+}
+
+func (self *Poller) handlePause(s sm.State, e *sm.Event) (next sm.State) {
+	self.interruptPolling(nil)
+	return statePaused
+}
+
+// Continue -------------------------------------------------------------------
+
+// Continue resumes the poller after a call to Pause or after the polling is
+// successful. The poller is automaticall paused before returning a PollResult,
+// otherwise gozmq.Poll would keep returning again and again until the user
+// reads what is available on the descriptors passed to the poller. We want to
+// prevent such a busy-waiting and flooding of the result channel.
+func (self *Poller) Continue() error {
+	errCh := make(chan error, 1)
+	self.sm.Emit(&sm.Event{
+		cmdContinue,
+		nil,
+	}, errCh)
+	return <-errCh
+}
+
+func (self *Poller) handleContinue(s sm.State, e *sm.Event) (next sm.State) {
+	self.cmdCh <- cmdContinue
+	return statePolling
+}
+
+// Close ----------------------------------------------------------------------
+
+// Close the poller and release all internal 0MQ sockets.
+func (self *Poller) Close(closedCh chan struct{}) error {
+	errCh := make(chan error, 1)
+	self.sm.Emit(&sm.Event{
+		cmdClose,
+		closedCh,
+	}, errCh)
+	return <-errCh
+}
+
+func (self *Poller) handleClose(s sm.State, e *sm.Event) (next sm.State) {
+	closedCh := e.Data.(chan struct{})
+
+	// Signal the internal goroutine to exit next time it gets blocked in select.
+	close(self.cmdCh)
+
+	// Break polling if necessary.
+	// Use 'go' since we might not be blocked in Poll() and this call could
+	// block the whole thing.
+	if s == statePolling {
+		go self.interruptPolling(nil)
+	}
+
+	go func() {
+		<-self.sm.TerminatedChannel()
+
+		// Close internal 0MQ sockets.
+		self.intIn.Close()
+		self.intOut.Close()
+
+		close(self.pollCh)
+
+		// Send notice to the user.
+		if closedCh != nil {
+			close(closedCh)
+		}
+	}()
+
+	return stateClosed
+}
+
+// HELPERS --------------------------------------------------------------------
 
 // Interrupt the call to gozmq.Poll().
-func (self *Poller) interrupt() (err error) {
-	return self.intIn.Send([]byte{0}, 0)
+func (self *Poller) interruptPolling(intCh chan struct{}) error {
+	// Set up the callback interrupt channel.
+	if intCh != nil {
+		self.intCh = intCh
+	} else {
+		self.intCh = make(chan struct{})
+	}
+
+	// Interrupt gozmq.Poll()
+	err := self.intIn.Send([]byte{0}, 0)
+	if err != nil {
+		close(self.intCh)
+		self.intCh = nil
+		return err
+	}
+
+	select {
+	case <-self.intCh:
+		break
+	case <-self.sm.TerminatedChannel():
+		break
+	}
+
+	self.intCh = nil
+	return nil
 }
 
-/*
-The worker goroutine is there to run in the background and manage the polling.
-The whole mechanism of management is implemented by commands which are sent to
-the poller goroutine. A PAIR socket is added to the descriptors passed into the
-poller for polling. If it is necessary to break out of the loop, it is enough to
-signal that added PAIR socket and gozmq.Poll() returns.
-
-Once gozmq.Poll() returns, the PAIR socket is checked first for any commands. If
-there are no commands to process, the PollResult is sent back to the user.
-*/
-func (self *Poller) worker() {
+// Internal polling goroutine
+func (self *Poller) poll() {
 	intItem := zmq.PollItem{
 		Socket: self.intOut,
 		Events: zmq.POLLIN,
 	}
 
-	items := zmq.PollItems{intItem}
-	var lastItems zmq.PollItems
-
-	// When zmq.Poll fails, remove all the fds except intItem and set this flag.
-	// If zmq.Poll fails during the next iteration as well, exit the loop.
-	nuke := false
+	items := append(self.items, intItem)
 
 	for {
-		// Poll on the pollItems
+		// Poll on the poll items indefinitely.
 		rc, err := zmq.Poll(items, -1)
-		if err != nil {
-			self.pollChan <- &PollResult{rc, nil, err}
-			if nuke {
-				self.finalize(nil)
-				return
-			}
-			nuke = true
-			items = zmq.PollItems{intItem}
-			continue
-		}
-		nuke = false
 
-		// Just forward the return value if there is no interrupt
+		// Move to the PAUSED state. This happens before any send on a channel
+		// so we can be sure things happen in the right order.
+		errCh := make(chan error, 1)
+		self.sm.SetState(statePaused, errCh)
+		<-errCh
+
+		if err != nil {
+			self.pollCh <- &PollResult{rc, nil, err}
+			goto waitForOrders
+		}
+
 		if items[len(items)-1].REvents&zmq.POLLIN == 0 {
-			self.pollChan <- &PollResult{rc, items[:len(items)-1], nil}
-			// Poll for commands only until Continue() is called
-			items = zmq.PollItems{intItem}
-			continue
-		}
-
-		// Process single interrupt
-		_, err = intItem.Socket.Recv(0)
-		if err != nil {
-			self.pollChan <- &PollResult{-1, nil, err}
-			return
-		}
-
-		cmd := <-self.cmdChan
-
-		switch cmd.Cmd {
-		case cmdPoll:
-			lastItems = *(cmd.Args.(*zmq.PollItems))
-			items = append(lastItems, intItem)
-		case cmdStop:
-			items = []zmq.PollItem{intItem}
-		case cmdContinue:
-			if lastItems != nil {
-				items = append(lastItems, intItem)
-			} else {
-				items = []zmq.PollItem{intItem}
+			// One of the user-defined sockets is available.
+			self.pollCh <- &PollResult{rc, items[:len(items)-1], nil}
+		} else {
+			// The internal interrupt socket is available for reading.
+			_, err = self.intOut.Recv(0)
+			if err != nil {
+				self.pollCh <- &PollResult{-1, nil, err}
 			}
-		case cmdClose:
-			// Return what was signaled at the moment of the interrupt
-			self.finalize(func() {
-				resChan := cmd.Args.(chan *PollResult)
-				resChan <- &PollResult{rc - 1, items[:len(items)-1], nil}
-				close(resChan)
-			})
-			return
-		default:
-			panic("Poller received an unknown command.")
+
+			// Signal that the polling was indeed interrupted.
+			close(self.intCh)
 		}
-	}
-}
 
-// Finalize the poller, make sure everything is stopped and closed.
-func (self *Poller) finalize(exitCallback func()) {
-	self.lock.Lock()
-	defer self.lock.Unlock()
-
-	// Close channels
-	close(self.cmdChan)
-	close(self.pollChan)
-
-	// Close the interrupt sockets
-	self.intIn.Close()
-	self.intOut.Close()
-
-	// Mark the poller as closed
-	self.state = stateClosed
-
-	// Signal exit
-	if exitCallback != nil {
-		exitCallback()
+		// Wait for further commands.
+	waitForOrders:
+		cmd, ok := <-self.cmdCh
+		if !ok {
+			// The command channel has been closed, return.
+			go self.sm.Terminate()
+			return
+		}
+		switch cmd {
+		case cmdPoll:
+			items = append(self.items, intItem)
+			fallthrough
+		case cmdContinue:
+			continue
+		default:
+			panic("Unexpected command received")
+		}
 	}
 }

@@ -30,9 +30,13 @@ import (
 	"time"
 )
 
-import zmq "github.com/alecthomas/gozmq"
+import (
+	zmq "github.com/alecthomas/gozmq"
+)
 
-func TestSendAndPoll(test *testing.T) {
+// Tests ----------------------------------------------------------------------
+
+func TestPoller_SingleSendAndPoll(test *testing.T) {
 	factory, err := NewSocketFactory()
 	if err != nil {
 		test.Fatal(err)
@@ -49,15 +53,18 @@ func TestSendAndPoll(test *testing.T) {
 		test.Fatal(err)
 	}
 
-	poller, err := New(factory.ctx, 0)
+	poller, err := New(factory.ctx)
 	if err != nil {
 		test.Fatal(err)
 	}
 
-	ch, err := poller.Poll(zmq.PollItems{zmq.PollItem{
-		Socket: out,
-		Events: zmq.POLLIN,
-	}})
+	pollCh := make(chan *PollResult, 1)
+	err = poller.Poll(zmq.PollItems{
+		{
+			Socket: out,
+			Events: zmq.POLLIN,
+		},
+	}, pollCh)
 	if err != nil {
 		test.Fatal(err)
 	}
@@ -65,19 +72,20 @@ func TestSendAndPoll(test *testing.T) {
 	timeout := time.After(time.Second)
 
 	select {
-	case <-ch:
+	case <-pollCh:
 		msg, err := out.Recv(0)
 		if err != nil {
 			test.Fatal(err)
 		}
 		if msg[0] != 42 {
-			test.Fatal(errors.New("reveived != expected"))
+			test.Fatal("received != expected")
 		}
 	case <-timeout:
-		test.Fatal(errors.New("Test timed out."))
+		test.Fatal("Test timed out.")
 	}
 
-	ch, err = poller.Close()
+	exitCh := make(chan struct{})
+	err = poller.Close(exitCh)
 	if err != nil {
 		test.Fatal(err)
 	}
@@ -85,102 +93,90 @@ func TestSendAndPoll(test *testing.T) {
 	timeout = time.After(time.Second)
 
 	select {
-	case leftovers := <-ch:
-		if leftovers.Count > 0 || len(leftovers.Items) > 0 {
-			test.Fatal(errors.New("Unexpected leftovers received."))
-		}
+	case <-exitCh:
+		return
 	case <-timeout:
-		test.Fatal(errors.New("Test timed out."))
+		test.Error("Test timed out.")
 	}
 }
 
-func TestPoller(test *testing.T) {
+// Benchmarks -----------------------------------------------------------------
+
+func BenchmarkPoller_Raw0MQ(b *testing.B) {
 	factory, err := NewSocketFactory()
 	if err != nil {
-		test.Fatal(err)
+		b.Fatal(err)
 	}
 	defer factory.Close()
 
 	in, out, err := factory.NewPipe()
 	if err != nil {
-		test.Fatal(err)
+		b.Fatal(err)
 	}
 
-	data := make([]byte, 1000)
-	for i := range data {
-		data[i] = 1
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if err := in.Send([]byte{0}, 0); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := out.Recv(0); err != nil {
+			b.Fatal(err)
+		}
 	}
 
-	go func() {
-		for _, d := range data {
-			err := in.Send([]byte{d}, 0)
-			if err != nil {
-				test.Error(err)
-				return
-			}
-		}
-	}()
+	b.StopTimer()
+}
 
-	exit := make(chan bool, 1)
+func BenchmarkPoller_Poller(b *testing.B) {
+	factory, err := NewSocketFactory()
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer factory.Close()
 
-	go func() {
-		defer func() {
-			exit <- true
-		}()
+	in, out, err := factory.NewPipe()
+	if err != nil {
+		b.Fatal(err)
+	}
 
-		poller, ex := New(factory.ctx, 0)
-		if ex != nil {
-			test.Error(ex)
-			return
-		}
+	poller, ex := New(factory.ctx)
+	if ex != nil {
+		b.Error(ex)
+		return
+	}
+	defer poller.Close(nil)
 
-		pollChan, ex := poller.Poll([]zmq.PollItem{zmq.PollItem{
+	pollCh := make(chan *PollResult, 1)
+	ex = poller.Poll(zmq.PollItems{
+		{
 			Socket: out,
 			Events: zmq.POLLIN,
-		}})
-		if ex != nil {
-			test.Error(ex)
-			return
-		}
-
-		for _, d := range data {
-			res := <-pollChan
-			if res.Error != nil {
-				test.Error(res.Error)
-				return
-			}
-			msg, ex := out.Recv(0)
-			if ex != nil {
-				test.Error(ex)
-				return
-			}
-			if msg[0] != d {
-				test.Error(errors.New("received != expected"))
-				return
-			}
-			ex = poller.Continue()
-			if ex != nil {
-				test.Error(ex)
-				return
-			}
-		}
-
-		leftovers, ex := poller.Close()
-		if ex != nil {
-			test.Error(ex)
-			return
-		}
-		<-leftovers
-	}()
-
-	timeout := time.After(time.Second)
-
-	select {
-	case <-exit:
-		break
-	case <-timeout:
-		test.Error(errors.New("Test timed out."))
+		},
+	}, pollCh)
+	if ex != nil {
+		b.Error(ex)
+		return
 	}
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if err := in.Send([]byte{0}, 0); err != nil {
+			b.Fatal(err)
+		}
+
+		<-pollCh
+		if err := poller.Continue(); err != nil {
+			b.Fatal(err)
+		}
+
+		if _, err := out.Recv(0); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.StopTimer()
 }
 
 /**
