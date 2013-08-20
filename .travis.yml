@@ -1,7 +1,7 @@
 language: go
 go:
-  - 1.0
   - 1.1
+  - tip
 
 before_install:
   - sudo apt-get install libzmq3-dev
@@ -10,4 +10,4 @@ install:
   - go get -tags zmq_3_x -d -v
 
 script:
-  - go test -tags zmq_3_x -v
+  - go test -tags zmq_3_x -v -bench=. -benchmem
