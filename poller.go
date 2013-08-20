@@ -26,31 +26,32 @@
 package poller
 
 import (
-	"errors"
-	"sync"
-)
-
-import (
-	sm "github.com/tchap/go-statemachine"
-	log "github.com/cihub/seelog"
 	zmq "github.com/alecthomas/gozmq"
+	log "github.com/cihub/seelog"
+	sm "github.com/tchap/go-statemachine"
 )
 
 const (
 	interruptEndpoint = "inproc://gozmqPoller_8DUvkrWQYP"
 )
 
-// PUBLIC TYPES ---------------------------------------------------------------
+// EXPORTED TYPES -------------------------------------------------------------
 
 type Poller struct {
 	// Internal state machine
 	sm *sm.StateMachine
 
-	// For sending interrupts
+	// Internal stuff for managing the internal goroutine
 	intIn  *zmq.Socket
 	intOut *zmq.Socket
+	intCh  chan struct{}
+	cmdCh  chan sm.State
 
-	// A logger that is being used if set. Set this before any other action.
+	// Placeholders for various arguments to be passed to the internal goroutine.
+	items  zmq.PollItems
+	pollCh chan<- *PollResult
+
+	// A logger that is being used. seelog.Current is the default.
 	Logger log.LoggerInterface
 }
 
@@ -108,29 +109,38 @@ func New(ctx *zmq.Context) (p *Poller, err error) {
 	// Create and inititalise the internal state machine.
 	psm := sm.New(stateInitial, 4, 4, 0)
 
-	p =: &Poller{
-		sm:       psm,
-		intIn:    in,
-		intOut:   out,
+	p = &Poller{
+		sm:     psm,
+		intIn:  in,
+		intOut: out,
+		cmdCh:  make(chan sm.State, 1),
 	}
 
 	// POLL
-	psm.On(cmdPoll, stateInitial, p.handlePoll)
-	psm.On(cmdPoll, statePolling, p.handlePoll)
-	psm.On(cmdPoll, statePaused, p.handlePoll)
+	psm.On(cmdPoll, []sm.State{
+		stateInitial,
+		statePolling,
+		statePaused,
+	}, p.handlePoll)
 
 	// PAUSE
-	psm.On(cmdPause, statePolling, p.handlePause)
+	psm.On(cmdPause, []sm.State{
+		statePolling,
+	}, p.handlePause)
 
 	// CONTINUE
-	psm.On(cmdContinue, statePaused, p.handleContinue)
+	psm.On(cmdContinue, []sm.State{
+		statePaused,
+	}, p.handleContinue)
 
 	// CLOSE
-	psm.On(cmdClose, stateInitial, p.handleClose)
-	psm.On(cmdClose, statePolling, p.handleClose)
-	psm.On(cmdClose, statePaused, p.handleClose)
+	psm.On(cmdClose, []sm.State{
+		stateInitial,
+		statePolling,
+		statePaused,
+	}, p.handleClose)
 
-	return p
+	return
 }
 
 // Poll -----------------------------------------------------------------------
@@ -140,7 +150,9 @@ type pollArgs struct {
 	pollCh chan<- *PollResult
 }
 
-// Poll starts polling on the set of socket descriptors.
+// Poll starts polling on the set of socket descriptors passed as a parameter.
+// The channel passed into this method is used for sending notifications when
+// gozmq.Poll() unblocks.
 func (self *Poller) Poll(items zmq.PollItems, pollCh chan<- *PollResult) error {
 	if len(items) == 0 {
 		panic("Poll items are empty")
@@ -159,21 +171,29 @@ func (self *Poller) Poll(items zmq.PollItems, pollCh chan<- *PollResult) error {
 
 func (self *Poller) handlePoll(s sm.State, e *sm.Event) (next sm.State) {
 	args := e.Data.(*pollArgs)
-	if s == statePolling {
-		self.interruptPoll()
-		close(self.pollCh)
-	}
+
 	self.items = args.items
 	self.pollCh = args.pollCh
-	go self.pollLoop()
+
+	// Break the current polling loop if there is any.
+	if s == statePolling {
+		err := self.interruptPolling(nil)
+		if err != nil {
+			args.pollCh <- &PollResult{-1, nil, err}
+			close(self.pollCh)
+		}
+		self.cmdCh <- cmdPoll
+	} else {
+		go self.poll()
+	}
+
 	return statePolling
 }
 
 // Pause ----------------------------------------------------------------------
 
 // Pause will pause polling until Continue is called again. This call breaks
-// the call to gozmq.Poll and makes the poller wait for more commands to come,
-// no other descriptors.
+// the call to gozmq.Poll and makes the poller wait for more commands to come.
 //
 // If pauseCh is not nil, it will be closed when the poll call is interrupted
 // to signal that the 0MQ sockets are no longer in use.
@@ -187,11 +207,7 @@ func (self *Poller) Pause(pauseCh chan struct{}) error {
 }
 
 func (self *Poller) handlePause(s sm.State, e *sm.Event) (next sm.State) {
-	pauseCh := e.Data.(chan struct{})
-	self.interruptPoll()
-	if pauseCh != nil {
-		close(pauseCh)
-	}
+	self.interruptPolling(nil)
 	return statePaused
 }
 
@@ -206,95 +222,143 @@ func (self *Poller) Continue() error {
 	errCh := make(chan error, 1)
 	self.sm.Emit(&sm.Event{
 		cmdContinue,
-		nil
+		nil,
 	}, errCh)
 	return <-errCh
 }
 
 func (self *Poller) handleContinue(s sm.State, e *sm.Event) (next sm.State) {
-	go self.pollLoop()
+	self.cmdCh <- cmdContinue
 	return statePolling
 }
 
 // Close ----------------------------------------------------------------------
 
 // Close the poller and release all internal 0MQ sockets.
-func (self *Poller) Close(closeCh chan struct{}) error {
+func (self *Poller) Close(closedCh chan struct{}) error {
 	errCh := make(chan error, 1)
 	self.sm.Emit(&sm.Event{
 		cmdClose,
-		closeCh,
+		closedCh,
 	}, errCh)
 	return <-errCh
 }
 
 func (self *Poller) handleClose(s sm.State, e *sm.Event) (next sm.State) {
-	closeCh := e.Data.(chan struct{})
+	closedCh := e.Data.(chan struct{})
 
+	// Signal the internal goroutine to exit next time it gets blocked in select.
+	close(self.cmdCh)
+
+	// Break polling if necessary.
+	// Use 'go' since we might not be blocked in Poll() and this call could
+	// block the whole thing.
 	if s == statePolling {
-		self.interruptPoll()
-		self.items = nil
+		go self.interruptPolling(nil)
+	}
+
+	go func() {
+		<-self.sm.TerminatedChannel()
+
+		// Close internal 0MQ sockets.
+		self.intIn.Close()
+		self.intOut.Close()
+
 		close(self.pollCh)
-	}
 
-	err := self.intIn.Close()
-	if err != nil && self.logger != nil {
-		self.logger.Warn(err)
-	}
-	err = self.intOut.Close()
-	if err != nil && self.logger != nil {
-		self.logger.Warn(err)
-	}
+		// Send notice to the user.
+		if closedCh != nil {
+			close(closedCh)
+		}
+	}()
 
-	self.sm.Terminate()
-	<-self.sm.TerminatedChannel()
-
-	if closeCh != nil {
-		close(closeCh)
-	}
+	return stateClosed
 }
 
 // HELPERS --------------------------------------------------------------------
 
 // Interrupt the call to gozmq.Poll().
-func (self *Poller) interrupt() error {
-	return self.intIn.Send([]byte{0}, 0)
+func (self *Poller) interruptPolling(intCh chan struct{}) error {
+	// Set up the callback interrupt channel.
+	if intCh != nil {
+		self.intCh = intCh
+	} else {
+		self.intCh = make(chan struct{})
+	}
+
+	// Interrupt gozmq.Poll()
+	err := self.intIn.Send([]byte{0}, 0)
+	if err != nil {
+		close(self.intCh)
+		self.intCh = nil
+		return err
+	}
+
+	select {
+	case <-self.intCh:
+		break
+	case <-self.sm.TerminatedChannel():
+		break
+	}
+
+	self.intCh = nil
+	return nil
 }
 
-// Internal poll loop goroutine
-func (self *Poller) pollLoop() {
+// Internal polling goroutine
+func (self *Poller) poll() {
 	intItem := zmq.PollItem{
 		Socket: self.intOut,
 		Events: zmq.POLLIN,
 	}
 
-	items = append(self.items, intItem)
+	items := append(self.items, intItem)
 
 	for {
 		// Poll on the poll items indefinitely.
 		rc, err := zmq.Poll(items, -1)
+
+		// Move to the PAUSED state. This happens before any send on a channel
+		// so we can be sure things happen in the right order.
+		errCh := make(chan error, 1)
+		self.sm.SetState(statePaused, errCh)
+		<-errCh
+
 		if err != nil {
-			if self.logger != nil {
-				self.logger.Error(err)
-			}
 			self.pollCh <- &PollResult{rc, nil, err}
-			close(self.pollCh)
-			self.pollCh = nil
+			goto waitForOrders
 		}
 
-		// Just forward the return value if there is no interrupt.
 		if items[len(items)-1].REvents&zmq.POLLIN == 0 {
+			// One of the user-defined sockets is available.
 			self.pollCh <- &PollResult{rc, items[:len(items)-1], nil}
-			// Poll for commands only until Continue() is called.
-			items = zmq.PollItems{intItem}
-			continue
+		} else {
+			// The internal interrupt socket is available for reading.
+			_, err = self.intOut.Recv(0)
+			if err != nil {
+				self.pollCh <- &PollResult{-1, nil, err}
+			}
+
+			// Signal that the polling was indeed interrupted.
+			close(self.intCh)
 		}
 
-		// Interrupt received, exiting...
-		_, err = intItem.Socket.Recv(0)
-		if err != nil {
-			self.pollChan <- &PollResult{-1, nil, err}
+		// Wait for further commands.
+	waitForOrders:
+		cmd, ok := <-self.cmdCh
+		if !ok {
+			// The command channel has been closed, return.
+			go self.sm.Terminate()
 			return
+		}
+		switch cmd {
+		case cmdPoll:
+			items = append(self.items, intItem)
+			fallthrough
+		case cmdContinue:
+			continue
+		default:
+			panic("Unexpected command received")
 		}
 	}
 }
