@@ -12,6 +12,11 @@ There is another advantage in using Poller - you can stop the polling without
 waiting for its timeout. This is not possible with `gozmq.Poll`, or rather you
 have to write additional code, and that is exactly what Poller does for you.
 
+# State of the Project
+
+I am still developing this, so things may and will change if I find it more
+appropriate for my use cases.
+
 # Installation
 
 This is just yet another GitHub repository which you can directly import into
@@ -21,46 +26,9 @@ import poller "github.com/tchap/gozmq-poller"
 ```
 Do not forget to issue `go get` to download the package.
 
-# Example
+# Examples
 
-```go
-package main
-
-import "fmt"
-
-import (
-	zmq "github.com/alecthomas/gozmq"
-	poller "github.com/tchap/gozmq-poller"
-)
-
-func main() {
-	ctx, _ := zmq.NewContext()
-	in, _ := ctx.NewSocket(zmq.PUSH)
-	out, _ := ctx.NewSocket(zmq.PULL)
-
-	out.Bind("inproc://pipe")
-	in.Connect("inproc://pipe")
-
-	in.Send([]byte{0}, 0)
-
-	p, _ := poller.New(ctx)
-	ch, _ := p.Poll(zmq.PollItems{zmq.PollItem{
-		Socket: out,
-		Events: zmq.POLLIN,
-	}})
-
-	<-ch
-	out.Recv(0)
-
-	leftovers, _ := p.Close()
-	<-leftovers
-
-	fmt.Println("Data received")
-	in.Close()
-	out.Close()
-	ctx.Close()
-}
-```
+Check the `examples` directory to see some examples of how to use Poller.
 
 # Documentation
 
