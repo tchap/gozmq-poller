@@ -84,16 +84,20 @@ func TestPoller_SingleSendAndPoll(test *testing.T) {
 		test.Fatal("Test timed out.")
 	}
 
-	exitCh := make(chan struct{})
-	err = poller.Close(exitCh)
-	if err != nil {
-		test.Fatal(err)
-	}
+	closedCh := make(chan struct{})
+
+	go func() {
+		err = poller.Close()
+		if err != nil {
+			test.Fatal(err)
+		}
+		close(closedCh)
+	}()
 
 	timeout = time.After(time.Second)
 
 	select {
-	case <-exitCh:
+	case <-closedCh:
 		return
 	case <-timeout:
 		test.Error("Test timed out.")
@@ -145,7 +149,7 @@ func BenchmarkPoller_Poller(b *testing.B) {
 		b.Error(ex)
 		return
 	}
-	defer poller.Close(nil)
+	defer poller.Close()
 
 	pollCh := make(chan *PollResult, 1)
 	ex = poller.Poll(zmq.PollItems{

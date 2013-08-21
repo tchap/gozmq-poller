@@ -28,33 +28,35 @@ import (
 
 import (
 	zmq "github.com/alecthomas/gozmq"
-	gzu "github.com/tchap/gozmq-utils"
+	poller "github.com/tchap/gozmq-poller"
 )
 
 func main() {
 	ctx, _ := zmq.NewContext()
-	in, _ := ctx.NewSocket(zmq.PUSH)
+	defer ctx.Close()
 	out, _ := ctx.NewSocket(zmq.PULL)
+	defer out.Close()
+	in, _ := ctx.NewSocket(zmq.PUSH)
+	defer in.Close()
 
 	out.Bind("inproc://pipe")
 	in.Connect("inproc://pipe")
 
+	p, _ := poller.New(ctx)
+
+	pollCh := make(chan *poller.PollResult, 1)
+	p.Poll(zmq.PollItems{
+		{
+			Socket: out,
+			Events: zmq.POLLIN,
+		},
+	}, pollCh)
+
 	in.Send([]byte{0}, 0)
 
-	p, _ := gzu.NewPoller(ctx, 0)
-	ch, _ := p.Poll(zmq.PollItems{zmq.PollItem{
-		Socket: out,
-		Events: zmq.POLLIN,
-	}})
-
-	<-ch
+	<-pollCh
 	out.Recv(0)
-
-	wait, _ := p.Close()
-	<-wait
-
 	fmt.Println("Data received")
-	in.Close()
-	out.Close()
-	ctx.Close()
+
+	p.Close()
 }

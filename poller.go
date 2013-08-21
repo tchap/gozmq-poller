@@ -107,7 +107,7 @@ func New(ctx *zmq.Context) (p *Poller, err error) {
 	}
 
 	// Create and inititalise the internal state machine.
-	psm := sm.New(stateInitial, 4, 4, 0)
+	psm := sm.New(stateInitial, 4, 4)
 
 	p = &Poller{
 		sm:     psm,
@@ -161,12 +161,10 @@ func (self *Poller) Poll(items zmq.PollItems, pollCh chan<- *PollResult) error {
 		panic("Poll channel is nil")
 	}
 
-	errCh := make(chan error, 1)
-	self.sm.Emit(&sm.Event{
+	return self.sm.Emit(&sm.Event{
 		cmdPoll,
 		&pollArgs{items, pollCh},
-	}, errCh)
-	return <-errCh
+	})
 }
 
 func (self *Poller) handlePoll(s sm.State, e *sm.Event) (next sm.State) {
@@ -195,19 +193,24 @@ func (self *Poller) handlePoll(s sm.State, e *sm.Event) (next sm.State) {
 // Pause will pause polling until Continue is called again. This call breaks
 // the call to gozmq.Poll and makes the poller wait for more commands to come.
 //
-// If pauseCh is not nil, it will be closed when the poll call is interrupted
-// to signal that the 0MQ sockets are no longer in use.
-func (self *Poller) Pause(pauseCh chan struct{}) error {
+// This method returns after gozmq.Poll is interrupted and 0MQ sockets are not
+// being used any more.
+func (self *Poller) Pause() error {
 	errCh := make(chan error, 1)
-	self.sm.Emit(&sm.Event{
+	err := self.sm.Emit(&sm.Event{
 		cmdPause,
-		pauseCh,
-	}, errCh)
+		errCh,
+	})
+	if err != nil {
+		return nil
+	}
 	return <-errCh
 }
 
 func (self *Poller) handlePause(s sm.State, e *sm.Event) (next sm.State) {
-	self.interruptPolling(nil)
+	errCh := e.Data.(chan<- error)
+	errCh <- self.interruptPolling(nil)
+	close(errCh)
 	return statePaused
 }
 
@@ -219,12 +222,10 @@ func (self *Poller) handlePause(s sm.State, e *sm.Event) (next sm.State) {
 // reads what is available on the descriptors passed to the poller. We want to
 // prevent such a busy-waiting and flooding of the result channel.
 func (self *Poller) Continue() error {
-	errCh := make(chan error, 1)
-	self.sm.Emit(&sm.Event{
+	return self.sm.Emit(&sm.Event{
 		cmdContinue,
 		nil,
-	}, errCh)
-	return <-errCh
+	})
 }
 
 func (self *Poller) handleContinue(s sm.State, e *sm.Event) (next sm.State) {
@@ -234,18 +235,22 @@ func (self *Poller) handleContinue(s sm.State, e *sm.Event) (next sm.State) {
 
 // Close ----------------------------------------------------------------------
 
-// Close the poller and release all internal 0MQ sockets.
-func (self *Poller) Close(closedCh chan struct{}) error {
+// Close the poller and release all internal 0MQ sockets. This method blocks
+// until all work is done.
+func (self *Poller) Close() error {
 	errCh := make(chan error, 1)
-	self.sm.Emit(&sm.Event{
+	err := self.sm.Emit(&sm.Event{
 		cmdClose,
-		closedCh,
-	}, errCh)
+		errCh,
+	})
+	if err != nil {
+		return err
+	}
 	return <-errCh
 }
 
 func (self *Poller) handleClose(s sm.State, e *sm.Event) (next sm.State) {
-	closedCh := e.Data.(chan struct{})
+	closedCh := e.Data.(chan error)
 
 	// Signal the internal goroutine to exit next time it gets blocked in select.
 	close(self.cmdCh)
@@ -254,7 +259,13 @@ func (self *Poller) handleClose(s sm.State, e *sm.Event) (next sm.State) {
 	// Use 'go' since we might not be blocked in Poll() and this call could
 	// block the whole thing.
 	if s == statePolling {
-		go self.interruptPolling(nil)
+		go func() {
+			if err := self.interruptPolling(nil); err != nil {
+				closedCh <- err
+				close(closedCh)
+				closedCh = nil
+			}
+		}()
 	}
 
 	go func() {
@@ -264,7 +275,10 @@ func (self *Poller) handleClose(s sm.State, e *sm.Event) (next sm.State) {
 		self.intIn.Close()
 		self.intOut.Close()
 
-		close(self.pollCh)
+		if self.pollCh != nil {
+			close(self.pollCh)
+			self.pollCh = nil
+		}
 
 		// Send notice to the user.
 		if closedCh != nil {
@@ -318,11 +332,8 @@ func (self *Poller) poll() {
 		// Poll on the poll items indefinitely.
 		rc, err := zmq.Poll(items, -1)
 
-		// Move to the PAUSED state. This happens before any send on a channel
-		// so we can be sure things happen in the right order.
-		errCh := make(chan error, 1)
-		self.sm.SetState(statePaused, errCh)
-		<-errCh
+		// Move to the PAUSED state.
+		self.sm.SetState(statePaused)
 
 		if err != nil {
 			self.pollCh <- &PollResult{rc, nil, err}
