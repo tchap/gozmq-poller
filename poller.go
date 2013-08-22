@@ -208,7 +208,7 @@ func (self *Poller) Pause() error {
 }
 
 func (self *Poller) handlePause(s sm.State, e *sm.Event) (next sm.State) {
-	errCh := e.Data.(chan<- error)
+	errCh := e.Data.(chan error)
 	errCh <- self.interruptPolling(nil)
 	close(errCh)
 	return statePaused
