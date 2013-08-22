@@ -106,7 +106,7 @@ func TestPoller_SingleSendAndPoll(test *testing.T) {
 
 // Benchmarks -----------------------------------------------------------------
 
-func BenchmarkPoller_Raw0MQ(b *testing.B) {
+func BenchmarkPoller_Raw0MQPoll(b *testing.B) {
 	factory, err := NewSocketFactory()
 	if err != nil {
 		b.Fatal(err)
@@ -124,6 +124,14 @@ func BenchmarkPoller_Raw0MQ(b *testing.B) {
 		if err := in.Send([]byte{0}, 0); err != nil {
 			b.Fatal(err)
 		}
+		if _, err := zmq.Poll(zmq.PollItems{
+			{
+				Socket: out,
+				Events: zmq.POLLIN,
+			},
+		}, -1); err != nil {
+			b.Fatal(err)
+		}
 		if _, err := out.Recv(0); err != nil {
 			b.Fatal(err)
 		}
@@ -132,7 +140,7 @@ func BenchmarkPoller_Raw0MQ(b *testing.B) {
 	b.StopTimer()
 }
 
-func BenchmarkPoller_Poller(b *testing.B) {
+func BenchmarkPoller_____Poller(b *testing.B) {
 	factory, err := NewSocketFactory()
 	if err != nil {
 		b.Fatal(err)
