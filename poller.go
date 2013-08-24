@@ -40,7 +40,7 @@ type PollerFactory struct {
 	ctx *zmq.Context
 }
 
-func NewPollerFactory(ctx *zmq.Context) *PollerFactory {
+func NewFactory(ctx *zmq.Context) *PollerFactory {
 	return &PollerFactory{ctx}
 }
 

@@ -52,7 +52,7 @@ func TestPoller_WithPaused(test *testing.T) {
 		test.Fatal(err)
 	}
 
-	poller, err := NewPollerFactory(factory.ctx).NewPoller(zmq.PollItems{
+	poller, err := NewFactory(factory.ctx).NewPoller(zmq.PollItems{
 		{
 			Socket: sock,
 			Events: zmq.POLLIN,
@@ -93,7 +93,7 @@ func TestPoller_Continue(test *testing.T) {
 		test.Fatal(err)
 	}
 
-	poller, err := NewPollerFactory(factory.ctx).NewPoller(zmq.PollItems{
+	poller, err := NewFactory(factory.ctx).NewPoller(zmq.PollItems{
 		{
 			Socket: out,
 			Events: zmq.POLLIN,
@@ -128,7 +128,7 @@ func TestPoller_Poll(test *testing.T) {
 		test.Fatal(err)
 	}
 
-	poller, err := NewPollerFactory(factory.ctx).NewPoller(zmq.PollItems{
+	poller, err := NewFactory(factory.ctx).NewPoller(zmq.PollItems{
 		{
 			Socket: out,
 			Events: zmq.POLLIN,
@@ -160,7 +160,7 @@ func TestPoller_Close(test *testing.T) {
 		test.Fatal(err)
 	}
 
-	poller, err := NewPollerFactory(factory.ctx).NewPoller(zmq.PollItems{
+	poller, err := NewFactory(factory.ctx).NewPoller(zmq.PollItems{
 		{
 			Socket: out,
 			Events: zmq.POLLIN,
@@ -227,7 +227,7 @@ func BenchmarkPoller__Poller(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	poller, err := NewPollerFactory(factory.ctx).NewPoller(zmq.PollItems{
+	poller, err := NewFactory(factory.ctx).NewPoller(zmq.PollItems{
 		{
 			Socket: out,
 			Events: zmq.POLLIN,
