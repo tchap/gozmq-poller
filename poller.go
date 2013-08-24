@@ -44,6 +44,9 @@ func NewPollerFactory(ctx *zmq.Context) *PollerFactory {
 	return &PollerFactory{ctx}
 }
 
+// Create a new poller associated with the PollItems passed as the argument.
+// The newly created poller is paused initially, so you must call Continue()
+// once before blocking on the polling channel for the first time.
 func (factory *PollerFactory) NewPoller(items zmq.PollItems) (p *Poller, err error) {
 	// Create and connect the internal interrupt sockets.
 	in, err := factory.ctx.NewSocket(zmq.PAIR)
