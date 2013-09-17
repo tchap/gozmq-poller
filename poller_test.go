@@ -67,18 +67,15 @@ func TestPoller_WithPaused(test *testing.T) {
 		test.Fatal(err)
 	}
 
-	exitCh := make(chan error, 1)
+	exitCh := make(chan struct{})
 
-	if err := poller.WithPaused(func(err error) {
-		exitCh <- err
+	if err := poller.WithPaused(func() {
 		close(exitCh)
 	}); err != nil {
 		test.Fatal(err)
 	}
 
-	if err := <-exitCh; err != nil {
-		test.Fatal(err)
-	}
+	<-exitCh
 }
 
 func TestPoller_Continue(test *testing.T) {

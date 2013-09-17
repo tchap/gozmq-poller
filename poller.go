@@ -161,32 +161,45 @@ func (self *Poller) Poll() (pollCh <-chan *PollResult) {
 
 // Command: WITHPAUSED --------------------------------------------------------
 
+type withPausedArgs struct {
+	errCh chan error
+	f     func()
+}
+
 // Run the closure and make sure the poller is paused while doing so. This is
 // userful if you want to send some data to one of the sockets being polled since
 // you cannot do both polling and sending. 0MQ sockets are not supposed to be used
 // from multiple threads at once.
-func (self *Poller) WithPaused(closure func(err error)) error {
-	return self.sm.Emit(&sm.Event{
+func (self *Poller) WithPaused(f func()) error {
+	errCh := make(chan error, 1)
+	if err := self.sm.Emit(&sm.Event{
 		cmdWithPaused,
-		closure,
-	})
+		&withPausedArgs{errCh, f},
+	}); err != nil {
+		return err
+	}
+	return <-errCh
 }
 
 func (self *Poller) handleWithPausedCommand(s sm.State, e *sm.Event) sm.State {
-	closure := e.Data.(func(err error))
+	args := e.Data.(*withPausedArgs)
 
 	if s == statePolling {
 		if err := self.interruptPolling(); err != nil {
-			closure(err)
+			args.errCh <- err
+			close(args.errCh)
 			return s
 		}
 	}
 
-	closure(nil)
+	args.f()
 
 	if s == statePolling {
 		self.continueCh <- true
 	}
+
+	args.errCh <- nil
+	close(args.errCh)
 
 	return s
 }
