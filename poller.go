@@ -86,6 +86,7 @@ func (factory *PollerFactory) NewPoller(items zmq.PollItems) (p *Poller, err err
 
 	// Command: WITHPAUSED
 	psm.On(cmdWithPaused, []sm.State{
+		stateInitialised,
 		statePolling,
 		statePaused,
 	}, p.handleWithPausedCommand)
