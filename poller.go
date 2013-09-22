@@ -45,7 +45,7 @@ func NewFactory(ctx *zmq.Context) *PollerFactory {
 }
 
 // Create a new poller associated with the PollItems passed as the argument.
-// The newly created poller is paused initially, so you must call Continue()
+// The newly created poller is paused initially, so you must call Resume()
 // once before blocking on the polling channel for the first time.
 func (factory *PollerFactory) NewPoller(items zmq.PollItems) (p *Poller, err error) {
 	// Create and connect the internal interrupt sockets.
@@ -91,12 +91,12 @@ func (factory *PollerFactory) NewPoller(items zmq.PollItems) (p *Poller, err err
 		statePaused,
 	}, p.handleWithPausedCommand)
 
-	// Command: CONTINUE
-	psm.On(cmdContinue, []sm.State{
+	// Command: RESUME
+	psm.On(cmdResume, []sm.State{
 		stateInitialised,
 		statePolling,
 		statePaused,
-	}, p.handleContinueCommand)
+	}, p.handleResumeCommand)
 
 	// Command: CLOSE
 	psm.On(cmdClose, []sm.State{
@@ -148,7 +148,7 @@ const (
 
 const (
 	cmdWithPaused = iota
-	cmdContinue
+	cmdResume
 	cmdClose
 
 	evtPollReturned
@@ -157,6 +157,7 @@ const (
 // Poll
 
 func (self *Poller) Poll() (pollCh <-chan *PollResult) {
+	self.resume()
 	return self.pollCh
 }
 
@@ -205,7 +206,7 @@ func (self *Poller) handleWithPausedCommand(s sm.State, e *sm.Event) sm.State {
 	return s
 }
 
-// Command: CONTINUE ----------------------------------------------------------
+// Command: RESUME ------------------------------------------------------------
 
 // The poller is automatically paused before returning a PollResult on the polling
 // channel. This method is to be called after all the data are read from the sockets
@@ -214,14 +215,17 @@ func (self *Poller) handleWithPausedCommand(s sm.State, e *sm.Event) sm.State {
 // If polling was not paused, gozmq.Poll would just keep returning again and again
 // until the user reads what is available on the descriptors passed to the poller.
 // We want to prevent such a busy waiting and flooding of the polling channel.
-func (self *Poller) Continue() error {
+//
+// This method used to be called Continue and it was necessary to call it manually,
+// but this is no longer true, all the work is being done in Poll itself.
+func (self *Poller) resume() error{
 	return self.sm.Emit(&sm.Event{
-		cmdContinue,
+		cmdResume,
 		nil,
 	})
 }
 
-func (self *Poller) handleContinueCommand(s sm.State, e *sm.Event) sm.State {
+func (self *Poller) handleResumeCommand(s sm.State, e *sm.Event) sm.State {
 	switch s {
 	case stateInitialised:
 		go self.poll()
@@ -354,7 +358,7 @@ func (self *Poller) poll() {
 			}
 		}
 
-		// Wait for CONTINUE.
+		// Wait for RESUME.
 		_, ok := <-self.continueCh
 		if !ok {
 			self.sm.Terminate()
