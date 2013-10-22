@@ -72,45 +72,6 @@ func TestPoller_Poll(test *testing.T) {
 	}
 }
 
-func TestPoller_WithPaused(test *testing.T) {
-	factory, err := NewSocketFactory()
-	if err != nil {
-		test.Fatal(err)
-	}
-	defer factory.Close()
-
-	sock, err := factory.NewSocket(zmq.ROUTER)
-	if err != nil {
-		test.Fatal(err)
-	}
-
-	err = sock.Bind("inproc://TestPoller_Pause")
-	if err != nil {
-		test.Fatal(err)
-	}
-
-	poller, err := NewFactory(factory.ctx).NewPoller(zmq.PollItems{
-		{
-			Socket: sock,
-			Events: zmq.POLLIN,
-		},
-	})
-	if err != nil {
-		test.Fatal(err)
-	}
-	defer poller.Close()
-
-	exitCh := make(chan struct{})
-
-	if err := poller.WithPaused(func() {
-		close(exitCh)
-	}); err != nil {
-		test.Fatal(err)
-	}
-
-	<-exitCh
-}
-
 func TestPoller_Close(test *testing.T) {
 	factory, err := NewSocketFactory()
 	if err != nil {

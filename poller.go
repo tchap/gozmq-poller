@@ -84,13 +84,6 @@ func (factory *PollerFactory) NewPoller(items zmq.PollItems) (p *Poller, err err
 		continueCh: make(chan bool, 1),
 	}
 
-	// Command: WITHPAUSED
-	psm.On(cmdWithPaused, []sm.State{
-		stateInitialised,
-		statePolling,
-		statePaused,
-	}, p.handleWithPausedCommand)
-
 	// Command: RESUME
 	psm.On(cmdResume, []sm.State{
 		stateInitialised,
@@ -147,8 +140,7 @@ const (
 )
 
 const (
-	cmdWithPaused = iota
-	cmdResume
+	cmdResume = iota
 	cmdClose
 
 	evtPollReturned
@@ -159,51 +151,6 @@ const (
 func (self *Poller) Poll() (pollCh <-chan *PollResult) {
 	self.resume()
 	return self.pollCh
-}
-
-// Command: WITHPAUSED --------------------------------------------------------
-
-type withPausedArgs struct {
-	errCh chan error
-	f     func()
-}
-
-// Run the closure and make sure the poller is paused while doing so. This is
-// userful if you want to send some data to one of the sockets being polled since
-// you cannot do both polling and sending. 0MQ sockets are not supposed to be used
-// from multiple threads at once.
-func (self *Poller) WithPaused(f func()) error {
-	errCh := make(chan error, 1)
-	if err := self.sm.Emit(&sm.Event{
-		cmdWithPaused,
-		&withPausedArgs{errCh, f},
-	}); err != nil {
-		return err
-	}
-	return <-errCh
-}
-
-func (self *Poller) handleWithPausedCommand(s sm.State, e *sm.Event) sm.State {
-	args := e.Data.(*withPausedArgs)
-
-	if s == statePolling {
-		if err := self.interruptPolling(); err != nil {
-			args.errCh <- err
-			close(args.errCh)
-			return s
-		}
-	}
-
-	args.f()
-
-	if s == statePolling {
-		self.continueCh <- true
-	}
-
-	args.errCh <- nil
-	close(args.errCh)
-
-	return s
 }
 
 // Command: RESUME ------------------------------------------------------------
