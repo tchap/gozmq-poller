@@ -42,15 +42,15 @@ func main() {
 	out.Bind("inproc://pipe")
 	in.Connect("inproc://pipe")
 
-	p, _ := poller.New(ctx)
-
-	pollCh := make(chan *poller.PollResult, 1)
-	p.Poll(zmq.PollItems{
+	f := poller.NewFactory(ctx)
+	p, _ := f.NewPoller(zmq.PollItems{
 		{
 			Socket: out,
 			Events: zmq.POLLIN,
 		},
-	}, pollCh)
+	})
+
+	pollCh := p.Poll()
 
 	in.Send([]byte{0}, 0)
 
